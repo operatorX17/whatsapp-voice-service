@@ -20,7 +20,6 @@ const app = express();
 const server = http.createServer(app);
 app.use(express.json());
 
-// State per call
 let whatsappPc = null;
 let currentCallId = null;
 let ultravoxWs = null;
@@ -31,9 +30,7 @@ console.log("🎙️  WhatsApp Voice + Ultravox AI");
 console.log("Phone ID:", process.env.HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID);
 console.log("Ultravox:", ULTRAVOX_API_KEY ? "✅" : "❌");
 
-app.get("/", (req, res) => {
-    res.json({ status: "ok", service: "whatsapp-voice-ultravox" });
-});
+app.get("/", (req, res) => res.json({ status: "ok" }));
 
 app.get("/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
@@ -54,9 +51,7 @@ app.post("/webhook", async (req, res) => {
         const call = change?.value?.calls?.[0];
         const contact = change?.value?.contacts?.[0];
 
-        if (!call || !call.id || !call.event) {
-            return res.sendStatus(200);
-        }
+        if (!call || !call.id || !call.event) return res.sendStatus(200);
 
         currentCallId = call.id;
 
@@ -68,29 +63,24 @@ app.post("/webhook", async (req, res) => {
             console.log(`📞 Call from ${callerName} (${callerNumber})`);
 
             if (!ULTRAVOX_API_KEY) {
-                console.log("⚠️ No Ultravox key");
                 await rejectCall(currentCallId);
                 return res.sendStatus(200);
             }
 
             try {
-                // Create Ultravox call
+                // Create Ultravox call with serverWebSocket medium
                 const ultravoxCall = await createUltravoxCall(callerName);
                 console.log("✅ Ultravox call:", ultravoxCall.callId);
-                console.log("✅ Join URL:", ultravoxCall.joinUrl);
 
-                // Setup WebRTC bridge
-                await setupWebRTCBridge(whatsappOfferSdp, ultravoxCall.joinUrl);
+                // Setup bridge
+                await setupBridge(whatsappOfferSdp, ultravoxCall.joinUrl);
             } catch (error) {
                 console.error("❌ Setup failed:", error.message);
-                if (error.response) {
-                    console.error("Response:", error.response.data);
-                }
+                if (error.response) console.error("Response:", JSON.stringify(error.response.data));
                 await rejectCall(currentCallId);
             }
-
         } else if (call.event === "terminate") {
-            console.log(`📞 Call ended: ${call.id}`);
+            console.log(`📞 Call ended`);
             cleanup();
         }
 
@@ -102,17 +92,23 @@ app.post("/webhook", async (req, res) => {
 });
 
 async function createUltravoxCall(callerName) {
-    // Try without medium first (let Ultravox use default WebRTC)
+    // Use serverWebSocket medium for server-to-server audio
     const response = await axios.post(
         "https://api.ultravox.ai/api/calls",
         {
-            systemPrompt: `You are a friendly healthcare assistant for WhatsApp. The caller is ${callerName}. 
-Help with booking diagnostic tests or ordering medicines. Be conversational and helpful.
-Start by greeting them warmly and asking how you can help today.`,
+            systemPrompt: `You are a friendly healthcare assistant. The caller is ${callerName}. 
+Help with booking diagnostic tests or ordering medicines. Be warm and conversational.
+Start by saying "Hello! Welcome to our healthcare service. How can I help you today?"`,
+            model: "fixie-ai/ultravox",
             voice: "Mark",
-            temperature: 0.7,
+            temperature: 0.6,
             firstSpeaker: "FIRST_SPEAKER_AGENT",
-            initialOutputMedium: "MESSAGE_MEDIUM_VOICE"
+            medium: {
+                serverWebSocket: {
+                    inputSampleRate: 8000,
+                    outputSampleRate: 8000
+                }
+            }
         },
         {
             headers: {
@@ -124,36 +120,39 @@ Start by greeting them warmly and asking how you can help today.`,
     return response.data;
 }
 
-async function setupWebRTCBridge(whatsappOfferSdp, ultravoxJoinUrl) {
-    // Setup WhatsApp peer connection
+async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
+    // Setup WhatsApp WebRTC
     whatsappPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-    // Create audio source for sending Ultravox audio to WhatsApp
+    // Audio source to send Ultravox audio to WhatsApp
     audioSource = new RTCAudioSource();
     const track = audioSource.createTrack();
     whatsappPc.addTrack(track);
 
-    // Handle incoming audio from WhatsApp
+    // Connect to Ultravox first
+    await connectToUltravox(ultravoxJoinUrl);
+
+    // Handle WhatsApp audio -> Ultravox
     whatsappPc.ontrack = (event) => {
-        console.log("🎵 WhatsApp audio track received");
+        console.log("🎵 WhatsApp audio received");
         const audioTrack = event.streams[0]?.getAudioTracks()[0];
         if (audioTrack) {
             audioSink = new RTCAudioSink(audioTrack);
             audioSink.ondata = (data) => {
-                // Send audio to Ultravox WebSocket
                 if (ultravoxWs && ultravoxWs.readyState === WebSocket.OPEN) {
-                    try {
-                        // Convert samples to Int16 PCM buffer
-                        const samples = data.samples;
-                        const int16 = new Int16Array(samples.length);
-                        for (let i = 0; i < samples.length; i++) {
-                            const s = Math.max(-1, Math.min(1, samples[i]));
-                            int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-                        }
-                        ultravoxWs.send(Buffer.from(int16.buffer));
-                    } catch (e) {
-                        // Ignore send errors
+                    // Convert Float32 samples to Int16 PCM at 8kHz
+                    // WhatsApp sends 48kHz, we need to downsample
+                    const samples = data.samples;
+                    const ratio = Math.floor(data.sampleRate / 8000);
+                    const outLen = Math.floor(samples.length / ratio);
+                    const int16 = new Int16Array(outLen);
+                    
+                    for (let i = 0; i < outLen; i++) {
+                        const s = samples[i * ratio];
+                        int16[i] = Math.max(-32768, Math.min(32767, Math.floor(s * 32767)));
                     }
+                    
+                    ultravoxWs.send(Buffer.from(int16.buffer));
                 }
             };
         }
@@ -172,17 +171,12 @@ async function setupWebRTCBridge(whatsappOfferSdp, ultravoxJoinUrl) {
     const finalSdp = answer.sdp.replace("a=setup:actpass", "a=setup:active");
     console.log("✅ Answer created");
 
-    // Connect to Ultravox WebSocket
-    await connectToUltravox(ultravoxJoinUrl);
-
     // Answer WhatsApp call
     const preOk = await answerWhatsAppCall(currentCallId, finalSdp, "pre_accept");
     if (preOk) {
         setTimeout(async () => {
-            const acceptOk = await answerWhatsAppCall(currentCallId, finalSdp, "accept");
-            if (acceptOk) {
-                console.log("✅ Call connected! AI ready.");
-            }
+            await answerWhatsAppCall(currentCallId, finalSdp, "accept");
+            console.log("✅ Call connected!");
         }, 1000);
     }
 }
@@ -193,83 +187,75 @@ async function connectToUltravox(joinUrl) {
         ultravoxWs = new WebSocket(joinUrl);
 
         ultravoxWs.on("open", () => {
-            console.log("✅ Ultravox WebSocket connected");
+            console.log("✅ Ultravox connected");
             resolve();
         });
 
         ultravoxWs.on("message", (data) => {
             if (Buffer.isBuffer(data)) {
-                // Binary = audio from Ultravox AI -> send to WhatsApp
-                if (audioSource) {
-                    try {
-                        const int16 = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
-                        audioSource.onData({
-                            samples: int16,
-                            sampleRate: 48000,
-                            bitsPerSample: 16,
-                            channelCount: 1
-                        });
-                    } catch (e) {
-                        // Ignore audio errors
+                // Audio from Ultravox (8kHz Int16 PCM) -> WhatsApp (48kHz)
+                if (audioSource && data.length > 0) {
+                    const int16 = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
+                    
+                    // Upsample from 8kHz to 48kHz
+                    const ratio = 6;
+                    const upsampled = new Int16Array(int16.length * ratio);
+                    for (let i = 0; i < int16.length; i++) {
+                        for (let j = 0; j < ratio; j++) {
+                            upsampled[i * ratio + j] = int16[i];
+                        }
                     }
+                    
+                    audioSource.onData({
+                        samples: upsampled,
+                        sampleRate: 48000,
+                        bitsPerSample: 16,
+                        channelCount: 1
+                    });
                 }
             } else {
-                // JSON message
                 try {
                     const msg = JSON.parse(data.toString());
                     if (msg.type === "transcript") {
                         console.log(`🗣️ ${msg.role}: ${msg.text}`);
                     } else if (msg.type === "state") {
                         console.log(`📊 State: ${msg.state}`);
-                    } else {
-                        console.log(`📨 Message: ${msg.type}`);
                     }
-                } catch (e) {
-                    // Not JSON
-                }
+                } catch (e) {}
             }
         });
 
         ultravoxWs.on("error", (err) => {
-            console.error("❌ Ultravox WS error:", err.message);
+            console.error("❌ Ultravox error:", err.message);
             reject(err);
         });
 
         ultravoxWs.on("close", (code, reason) => {
-            console.log(`🔌 Ultravox closed: ${code} ${reason}`);
+            console.log(`🔌 Ultravox closed: ${code}`);
         });
 
-        setTimeout(() => reject(new Error("Ultravox connection timeout")), 15000);
+        setTimeout(() => reject(new Error("Timeout")), 15000);
     });
 }
 
 async function answerWhatsAppCall(callId, sdp, action) {
     try {
-        console.log(`📤 Sending ${action}...`);
-        const response = await axios.post(
-            WHATSAPP_API_URL,
-            {
-                messaging_product: "whatsapp",
-                call_id: callId,
-                action: action,
-                session: { sdp_type: "answer", sdp: sdp }
-            },
-            {
-                headers: {
-                    Authorization: ACCESS_TOKEN,
-                    "Content-Type": "application/json"
-                }
-            }
-        );
+        const response = await axios.post(WHATSAPP_API_URL, {
+            messaging_product: "whatsapp",
+            call_id: callId,
+            action: action,
+            session: { sdp_type: "answer", sdp: sdp }
+        }, {
+            headers: { Authorization: ACCESS_TOKEN, "Content-Type": "application/json" }
+        });
 
         if (response.data?.success) {
             console.log(`✅ ${action} OK`);
             return true;
         }
-        console.warn(`⚠️ ${action} response:`, response.data);
         return false;
     } catch (error) {
-        console.error(`❌ ${action} error:`, error.response?.data || error.message);
+        console.error(`❌ ${action}:`, error.response?.data || error.message);
         return false;
     }
 }
@@ -280,13 +266,8 @@ async function rejectCall(callId) {
             messaging_product: "whatsapp",
             call_id: callId,
             action: "reject"
-        }, {
-            headers: { Authorization: ACCESS_TOKEN, "Content-Type": "application/json" }
-        });
-        console.log(`✅ Rejected: ${callId}`);
-    } catch (error) {
-        console.error("❌ Reject error:", error.message);
-    }
+        }, { headers: { Authorization: ACCESS_TOKEN, "Content-Type": "application/json" } });
+    } catch (e) {}
 }
 
 function cleanup() {
@@ -297,6 +278,4 @@ function cleanup() {
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, "0.0.0.0", () => {
-    console.log(`🎙️ Voice service on port ${PORT}`);
-});
+server.listen(PORT, "0.0.0.0", () => console.log(`🎙️ Port ${PORT}`));
