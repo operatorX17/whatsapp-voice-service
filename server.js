@@ -6,11 +6,9 @@ const WebSocket = require("ws");
 const {
     RTCPeerConnection,
     RTCSessionDescription,
-    MediaStream,
     nonstandard: { RTCAudioSink, RTCAudioSource }
 } = require("@roamhq/wrtc");
 
-// STUN server for NAT traversal
 const ICE_SERVERS = [{ urls: "stun:stun.relay.metered.ca:80" }];
 
 const WHATSAPP_API_URL = `https://graph.facebook.com/v24.0/${process.env.HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID}/calls`;
@@ -20,42 +18,35 @@ const ULTRAVOX_API_KEY = process.env.ULTRAVOX_API_KEY;
 
 const app = express();
 const server = http.createServer(app);
-
 app.use(express.json());
 
 // State per call
 let whatsappPc = null;
-let whatsappStream = null;
 let currentCallId = null;
 let ultravoxWs = null;
 let audioSource = null;
 let audioSink = null;
 
-console.log("🎙️  WhatsApp Voice Calling with Ultravox AI");
+console.log("🎙️  WhatsApp Voice + Ultravox AI");
 console.log("Phone ID:", process.env.HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID);
-console.log("Ultravox API:", ULTRAVOX_API_KEY ? "✅ Configured" : "❌ Missing");
+console.log("Ultravox:", ULTRAVOX_API_KEY ? "✅" : "❌");
 
-// Health check
 app.get("/", (req, res) => {
-    res.json({ status: "ok", service: "whatsapp-voice-ultravox", ultravox: !!ULTRAVOX_API_KEY });
+    res.json({ status: "ok", service: "whatsapp-voice-ultravox" });
 });
 
-// Webhook verification
 app.get("/webhook", (req, res) => {
     const mode = req.query["hub.mode"];
     const token = req.query["hub.verify_token"];
     const challenge = req.query["hub.challenge"];
-
     if (mode === "subscribe" && token === VERIFY_TOKEN) {
         console.log("✅ Webhook verified");
         res.send(challenge);
     } else {
-        console.log("❌ Webhook verification failed");
         res.sendStatus(403);
     }
 });
 
-// Handle WhatsApp call events
 app.post("/webhook", async (req, res) => {
     try {
         const entry = req.body?.entry?.[0];
@@ -74,29 +65,28 @@ app.post("/webhook", async (req, res) => {
             const callerName = contact?.profile?.name || "Unknown";
             const callerNumber = contact?.wa_id || "Unknown";
 
-            console.log(`📞 Incoming call from ${callerName} (${callerNumber})`);
+            console.log(`📞 Call from ${callerName} (${callerNumber})`);
 
             if (!ULTRAVOX_API_KEY) {
-                console.log("⚠️  Ultravox not configured, rejecting call");
+                console.log("⚠️ No Ultravox key");
                 await rejectCall(currentCallId);
                 return res.sendStatus(200);
             }
 
             try {
-                // Step 1: Create Ultravox call and get WebSocket URL
+                // Create Ultravox call with serverWebSocket medium
                 const ultravoxCall = await createUltravoxCall(callerName);
-                console.log("✅ Ultravox call created:", ultravoxCall.callId);
+                console.log("✅ Ultravox call:", ultravoxCall.callId);
 
-                // Step 2: Setup WebRTC with WhatsApp
-                await setupWhatsAppWebRTC(whatsappOfferSdp, ultravoxCall.joinUrl);
-                
+                // Setup WebRTC bridge
+                await setupWebRTCBridge(whatsappOfferSdp, ultravoxCall.joinUrl);
             } catch (error) {
-                console.error("❌ Failed to setup call:", error.message);
+                console.error("❌ Setup failed:", error.message);
                 await rejectCall(currentCallId);
             }
 
         } else if (call.event === "terminate") {
-            console.log(`📞 Call terminated: ${call.id}`);
+            console.log(`📞 Call ended: ${call.id}`);
             cleanup();
         }
 
@@ -111,19 +101,19 @@ async function createUltravoxCall(callerName) {
     const response = await axios.post(
         "https://api.ultravox.ai/api/calls",
         {
-            systemPrompt: `You are a friendly healthcare assistant for a WhatsApp bot. 
-The caller's name is ${callerName}. 
-Help them with:
-- Booking diagnostic lab tests (blood tests like CBC, LFT, RFT, thyroid, etc.)
-- Ordering medicines from pharmacy
-- Answering general healthcare questions
-
-Be conversational, helpful, and concise. Ask clarifying questions when needed.
-When they want to book a test or order medicine, collect the details and confirm.`,
+            systemPrompt: `You are a friendly healthcare assistant. The caller is ${callerName}. 
+Help with booking diagnostic tests or ordering medicines. Be conversational and helpful.
+Start by greeting them and asking how you can help today.`,
+            model: "fixie-ai/ultravox",
             voice: "Mark",
             temperature: 0.7,
             firstSpeaker: "FIRST_SPEAKER_AGENT",
-            initialOutputMedium: "MESSAGE_MEDIUM_VOICE"
+            medium: {
+                serverWebSocket: {
+                    inputSampleRate: 16000,
+                    outputSampleRate: 16000
+                }
+            }
         },
         {
             headers: {
@@ -132,37 +122,37 @@ When they want to book a test or order medicine, collect the details and confirm
             }
         }
     );
-
     return response.data;
 }
 
-async function setupWhatsAppWebRTC(whatsappOfferSdp, ultravoxJoinUrl) {
+async function setupWebRTCBridge(whatsappOfferSdp, ultravoxJoinUrl) {
     // Setup WhatsApp peer connection
     whatsappPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
 
-    // Create audio source for sending audio to WhatsApp
+    // Create audio source for sending Ultravox audio to WhatsApp
     audioSource = new RTCAudioSource();
     const track = audioSource.createTrack();
     whatsappPc.addTrack(track);
 
-    // Handle incoming audio from WhatsApp
+    // First connect to Ultravox
+    await connectToUltravox(ultravoxJoinUrl);
+
+    // Handle incoming audio from WhatsApp -> send to Ultravox
     whatsappPc.ontrack = (event) => {
-        console.log("🎵 Audio track received from WhatsApp");
-        whatsappStream = event.streams[0];
-        
-        // Create audio sink to capture WhatsApp audio
-        const audioTrack = whatsappStream.getAudioTracks()[0];
+        console.log("🎵 WhatsApp audio track received");
+        const audioTrack = event.streams[0]?.getAudioTracks()[0];
         if (audioTrack) {
             audioSink = new RTCAudioSink(audioTrack);
             audioSink.ondata = (data) => {
-                // Send audio to Ultravox
+                // Send raw PCM to Ultravox
                 if (ultravoxWs && ultravoxWs.readyState === WebSocket.OPEN) {
-                    // Convert to base64 and send
-                    const base64Audio = Buffer.from(data.samples.buffer).toString('base64');
-                    ultravoxWs.send(JSON.stringify({
-                        type: "input_audio",
-                        audio: base64Audio
-                    }));
+                    // Convert Float32 to Int16 PCM
+                    const samples = data.samples;
+                    const int16 = new Int16Array(samples.length);
+                    for (let i = 0; i < samples.length; i++) {
+                        int16[i] = Math.max(-32768, Math.min(32767, samples[i] * 32768));
+                    }
+                    ultravoxWs.send(Buffer.from(int16.buffer));
                 }
             };
         }
@@ -173,24 +163,21 @@ async function setupWhatsAppWebRTC(whatsappOfferSdp, ultravoxJoinUrl) {
         type: "offer",
         sdp: whatsappOfferSdp
     }));
-    console.log("✅ WhatsApp SDP offer set");
+    console.log("✅ WhatsApp offer set");
 
     // Create answer
     const answer = await whatsappPc.createAnswer();
     await whatsappPc.setLocalDescription(answer);
     const finalSdp = answer.sdp.replace("a=setup:actpass", "a=setup:active");
-    console.log("✅ WhatsApp SDP answer created");
-
-    // Connect to Ultravox WebSocket
-    await connectToUltravox(ultravoxJoinUrl);
+    console.log("✅ Answer created");
 
     // Answer WhatsApp call
-    const preAcceptOk = await answerWhatsAppCall(currentCallId, finalSdp, "pre_accept");
-    if (preAcceptOk) {
+    const preOk = await answerWhatsAppCall(currentCallId, finalSdp, "pre_accept");
+    if (preOk) {
         setTimeout(async () => {
             const acceptOk = await answerWhatsAppCall(currentCallId, finalSdp, "accept");
             if (acceptOk) {
-                console.log("✅ Call connected! AI is ready to talk.");
+                console.log("✅ Call connected! AI ready.");
             }
         }, 1000);
     }
@@ -198,58 +185,52 @@ async function setupWhatsAppWebRTC(whatsappOfferSdp, ultravoxJoinUrl) {
 
 async function connectToUltravox(joinUrl) {
     return new Promise((resolve, reject) => {
-        console.log("🔌 Connecting to Ultravox WebSocket...");
+        console.log("🔌 Connecting to Ultravox...");
         ultravoxWs = new WebSocket(joinUrl);
 
         ultravoxWs.on("open", () => {
-            console.log("✅ Connected to Ultravox");
+            console.log("✅ Ultravox connected");
             resolve();
         });
 
         ultravoxWs.on("message", (data) => {
-            try {
-                const msg = JSON.parse(data);
-                
-                if (msg.type === "audio") {
-                    // Received audio from Ultravox AI, send to WhatsApp
-                    const audioBuffer = Buffer.from(msg.audio, 'base64');
-                    if (audioSource) {
-                        // Convert to Int16Array for RTCAudioSource
-                        const samples = new Int16Array(audioBuffer.buffer);
-                        audioSource.onData({
-                            samples: samples,
-                            sampleRate: 16000,
-                            bitsPerSample: 16,
-                            channelCount: 1
-                        });
-                    }
-                } else if (msg.type === "transcript") {
-                    console.log(`🗣️ ${msg.role}: ${msg.text}`);
-                }
-            } catch (e) {
-                // Binary audio data
-                if (audioSource && data instanceof Buffer) {
-                    const samples = new Int16Array(data.buffer);
+            // Binary data = audio from Ultravox AI
+            if (Buffer.isBuffer(data)) {
+                if (audioSource) {
+                    // Convert to Int16Array and send to WhatsApp
+                    const int16 = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
                     audioSource.onData({
-                        samples: samples,
+                        samples: int16,
                         sampleRate: 16000,
                         bitsPerSample: 16,
                         channelCount: 1
                     });
                 }
+            } else {
+                // JSON message
+                try {
+                    const msg = JSON.parse(data.toString());
+                    if (msg.type === "transcript") {
+                        console.log(`🗣️ ${msg.role}: ${msg.text}`);
+                    } else if (msg.type === "state") {
+                        console.log(`📊 State: ${msg.state}`);
+                    }
+                } catch (e) {
+                    // Ignore parse errors
+                }
             }
         });
 
         ultravoxWs.on("error", (err) => {
-            console.error("❌ Ultravox WebSocket error:", err.message);
+            console.error("❌ Ultravox error:", err.message);
             reject(err);
         });
 
         ultravoxWs.on("close", () => {
-            console.log("🔌 Ultravox WebSocket closed");
+            console.log("🔌 Ultravox closed");
         });
 
-        setTimeout(() => reject(new Error("Ultravox connection timeout")), 10000);
+        setTimeout(() => reject(new Error("Ultravox timeout")), 10000);
     });
 }
 
@@ -272,57 +253,40 @@ async function answerWhatsAppCall(callId, sdp, action) {
         );
 
         if (response.data?.success) {
-            console.log(`✅ WhatsApp ${action} successful`);
+            console.log(`✅ ${action} OK`);
             return true;
         }
-        console.warn(`⚠️ WhatsApp ${action} not successful:`, response.data);
+        console.warn(`⚠️ ${action} failed:`, response.data);
         return false;
     } catch (error) {
-        console.error(`❌ Failed to ${action}:`, error.response?.data || error.message);
+        console.error(`❌ ${action} error:`, error.response?.data || error.message);
         return false;
     }
 }
 
 async function rejectCall(callId) {
     try {
-        await axios.post(
-            WHATSAPP_API_URL,
-            {
-                messaging_product: "whatsapp",
-                call_id: callId,
-                action: "reject"
-            },
-            {
-                headers: {
-                    Authorization: ACCESS_TOKEN,
-                    "Content-Type": "application/json"
-                }
-            }
-        );
-        console.log(`✅ Call rejected: ${callId}`);
+        await axios.post(WHATSAPP_API_URL, {
+            messaging_product: "whatsapp",
+            call_id: callId,
+            action: "reject"
+        }, {
+            headers: { Authorization: ACCESS_TOKEN, "Content-Type": "application/json" }
+        });
+        console.log(`✅ Rejected: ${callId}`);
     } catch (error) {
-        console.error("❌ Reject failed:", error.message);
+        console.error("❌ Reject error:", error.message);
     }
 }
 
 function cleanup() {
-    if (ultravoxWs) {
-        ultravoxWs.close();
-        ultravoxWs = null;
-    }
-    if (whatsappPc) {
-        whatsappPc.close();
-        whatsappPc = null;
-    }
-    if (audioSink) {
-        audioSink.stop();
-        audioSink = null;
-    }
+    if (ultravoxWs) { ultravoxWs.close(); ultravoxWs = null; }
+    if (whatsappPc) { whatsappPc.close(); whatsappPc = null; }
+    if (audioSink) { audioSink.stop(); audioSink = null; }
     audioSource = null;
-    whatsappStream = null;
 }
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, "0.0.0.0", () => {
-    console.log(`🎙️  Voice service running on port ${PORT}`);
+    console.log(`🎙️ Voice service on port ${PORT}`);
 });
