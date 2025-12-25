@@ -26,9 +26,9 @@ let ultravoxWs = null;
 let audioSource = null;
 let audioSink = null;
 
-// Audio buffer for accumulating Ultravox audio
-let audioBuffer = Buffer.alloc(0);
-const FRAME_SIZE = 960; // 480 samples * 2 bytes = 960 bytes (10ms at 48kHz)
+// Audio buffer - use array of bytes for simpler handling
+let pendingAudio = [];
+const SAMPLES_PER_FRAME = 480; // 10ms at 48kHz
 
 console.log("🎙️  WhatsApp Voice + Ultravox AI");
 console.log("Phone ID:", process.env.HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID);
@@ -121,7 +121,7 @@ Start by saying "Hello! Welcome to our healthcare service. How can I help you to
 
 async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
     whatsappPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    audioBuffer = Buffer.alloc(0);
+    pendingAudio = [];
 
     audioSource = new RTCAudioSource();
     const track = audioSource.createTrack();
@@ -138,7 +138,7 @@ async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
                 if (ultravoxWs && ultravoxWs.readyState === WebSocket.OPEN) {
                     // Downsample from 48kHz to 8kHz
                     const samples = data.samples;
-                    const ratio = 6; // 48000 / 8000
+                    const ratio = 6;
                     const outLen = Math.floor(samples.length / ratio);
                     const int16 = new Int16Array(outLen);
                     
@@ -173,6 +173,43 @@ async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
     }
 }
 
+function processUltravoxAudio(data) {
+    if (!audioSource || data.length === 0) return;
+    
+    try {
+        // Ultravox sends 8kHz Int16 PCM
+        // We need to upsample to 48kHz and send in 480-sample frames
+        
+        const inputSamples = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
+        
+        // Upsample 8kHz -> 48kHz (multiply by 6)
+        for (let i = 0; i < inputSamples.length; i++) {
+            const sample = inputSamples[i];
+            // Add 6 copies of each sample for upsampling
+            for (let j = 0; j < 6; j++) {
+                pendingAudio.push(sample);
+            }
+        }
+        
+        // Send complete 480-sample frames
+        while (pendingAudio.length >= SAMPLES_PER_FRAME) {
+            const frame = new Int16Array(SAMPLES_PER_FRAME);
+            for (let i = 0; i < SAMPLES_PER_FRAME; i++) {
+                frame[i] = pendingAudio.shift();
+            }
+            
+            audioSource.onData({
+                samples: frame,
+                sampleRate: 48000,
+                bitsPerSample: 16,
+                channelCount: 1
+            });
+        }
+    } catch (e) {
+        // Silently ignore audio errors
+    }
+}
+
 async function connectToUltravox(joinUrl) {
     return new Promise((resolve, reject) => {
         console.log("🔌 Connecting to Ultravox...");
@@ -185,41 +222,7 @@ async function connectToUltravox(joinUrl) {
 
         ultravoxWs.on("message", (data) => {
             if (Buffer.isBuffer(data)) {
-                // Audio from Ultravox (8kHz Int16) -> upsample to 48kHz for WhatsApp
-                if (audioSource && data.length > 0) {
-                    try {
-                        const int16In = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
-                        
-                        // Upsample 8kHz to 48kHz (ratio 6)
-                        const ratio = 6;
-                        const upsampled = new Int16Array(int16In.length * ratio);
-                        for (let i = 0; i < int16In.length; i++) {
-                            for (let j = 0; j < ratio; j++) {
-                                upsampled[i * ratio + j] = int16In[i];
-                            }
-                        }
-                        
-                        // Add to buffer
-                        const newData = Buffer.from(upsampled.buffer);
-                        audioBuffer = Buffer.concat([audioBuffer, newData]);
-                        
-                        // Send complete frames (960 bytes = 480 samples = 10ms at 48kHz)
-                        while (audioBuffer.length >= FRAME_SIZE) {
-                            const frame = audioBuffer.slice(0, FRAME_SIZE);
-                            audioBuffer = audioBuffer.slice(FRAME_SIZE);
-                            
-                            const samples = new Int16Array(frame.buffer, frame.byteOffset, frame.length / 2);
-                            audioSource.onData({
-                                samples: samples,
-                                sampleRate: 48000,
-                                bitsPerSample: 16,
-                                channelCount: 1
-                            });
-                        }
-                    } catch (e) {
-                        console.error("Audio error:", e.message);
-                    }
-                }
+                processUltravoxAudio(data);
             } else {
                 try {
                     const msg = JSON.parse(data.toString());
@@ -282,7 +285,7 @@ function cleanup() {
     if (whatsappPc) { whatsappPc.close(); whatsappPc = null; }
     if (audioSink) { audioSink.stop(); audioSink = null; }
     audioSource = null;
-    audioBuffer = Buffer.alloc(0);
+    pendingAudio = [];
 }
 
 const PORT = process.env.PORT || 3000;
