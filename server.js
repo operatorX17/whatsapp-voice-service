@@ -26,6 +26,10 @@ let ultravoxWs = null;
 let audioSource = null;
 let audioSink = null;
 
+// Audio buffer for accumulating Ultravox audio
+let audioBuffer = Buffer.alloc(0);
+const FRAME_SIZE = 960; // 480 samples * 2 bytes = 960 bytes (10ms at 48kHz)
+
 console.log("🎙️  WhatsApp Voice + Ultravox AI");
 console.log("Phone ID:", process.env.HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID);
 console.log("Ultravox:", ULTRAVOX_API_KEY ? "✅" : "❌");
@@ -68,15 +72,11 @@ app.post("/webhook", async (req, res) => {
             }
 
             try {
-                // Create Ultravox call with serverWebSocket medium
                 const ultravoxCall = await createUltravoxCall(callerName);
                 console.log("✅ Ultravox call:", ultravoxCall.callId);
-
-                // Setup bridge
                 await setupBridge(whatsappOfferSdp, ultravoxCall.joinUrl);
             } catch (error) {
                 console.error("❌ Setup failed:", error.message);
-                if (error.response) console.error("Response:", JSON.stringify(error.response.data));
                 await rejectCall(currentCallId);
             }
         } else if (call.event === "terminate") {
@@ -92,7 +92,6 @@ app.post("/webhook", async (req, res) => {
 });
 
 async function createUltravoxCall(callerName) {
-    // Use serverWebSocket medium for server-to-server audio
     const response = await axios.post(
         "https://api.ultravox.ai/api/calls",
         {
@@ -121,18 +120,15 @@ Start by saying "Hello! Welcome to our healthcare service. How can I help you to
 }
 
 async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
-    // Setup WhatsApp WebRTC
     whatsappPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    audioBuffer = Buffer.alloc(0);
 
-    // Audio source to send Ultravox audio to WhatsApp
     audioSource = new RTCAudioSource();
     const track = audioSource.createTrack();
     whatsappPc.addTrack(track);
 
-    // Connect to Ultravox first
     await connectToUltravox(ultravoxJoinUrl);
 
-    // Handle WhatsApp audio -> Ultravox
     whatsappPc.ontrack = (event) => {
         console.log("🎵 WhatsApp audio received");
         const audioTrack = event.streams[0]?.getAudioTracks()[0];
@@ -140,10 +136,9 @@ async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
             audioSink = new RTCAudioSink(audioTrack);
             audioSink.ondata = (data) => {
                 if (ultravoxWs && ultravoxWs.readyState === WebSocket.OPEN) {
-                    // Convert Float32 samples to Int16 PCM at 8kHz
-                    // WhatsApp sends 48kHz, we need to downsample
+                    // Downsample from 48kHz to 8kHz
                     const samples = data.samples;
-                    const ratio = Math.floor(data.sampleRate / 8000);
+                    const ratio = 6; // 48000 / 8000
                     const outLen = Math.floor(samples.length / ratio);
                     const int16 = new Int16Array(outLen);
                     
@@ -158,20 +153,17 @@ async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
         }
     };
 
-    // Set WhatsApp offer
     await whatsappPc.setRemoteDescription(new RTCSessionDescription({
         type: "offer",
         sdp: whatsappOfferSdp
     }));
     console.log("✅ WhatsApp offer set");
 
-    // Create answer
     const answer = await whatsappPc.createAnswer();
     await whatsappPc.setLocalDescription(answer);
     const finalSdp = answer.sdp.replace("a=setup:actpass", "a=setup:active");
     console.log("✅ Answer created");
 
-    // Answer WhatsApp call
     const preOk = await answerWhatsAppCall(currentCallId, finalSdp, "pre_accept");
     if (preOk) {
         setTimeout(async () => {
@@ -193,25 +185,40 @@ async function connectToUltravox(joinUrl) {
 
         ultravoxWs.on("message", (data) => {
             if (Buffer.isBuffer(data)) {
-                // Audio from Ultravox (8kHz Int16 PCM) -> WhatsApp (48kHz)
+                // Audio from Ultravox (8kHz Int16) -> upsample to 48kHz for WhatsApp
                 if (audioSource && data.length > 0) {
-                    const int16 = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
-                    
-                    // Upsample from 8kHz to 48kHz
-                    const ratio = 6;
-                    const upsampled = new Int16Array(int16.length * ratio);
-                    for (let i = 0; i < int16.length; i++) {
-                        for (let j = 0; j < ratio; j++) {
-                            upsampled[i * ratio + j] = int16[i];
+                    try {
+                        const int16In = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
+                        
+                        // Upsample 8kHz to 48kHz (ratio 6)
+                        const ratio = 6;
+                        const upsampled = new Int16Array(int16In.length * ratio);
+                        for (let i = 0; i < int16In.length; i++) {
+                            for (let j = 0; j < ratio; j++) {
+                                upsampled[i * ratio + j] = int16In[i];
+                            }
                         }
+                        
+                        // Add to buffer
+                        const newData = Buffer.from(upsampled.buffer);
+                        audioBuffer = Buffer.concat([audioBuffer, newData]);
+                        
+                        // Send complete frames (960 bytes = 480 samples = 10ms at 48kHz)
+                        while (audioBuffer.length >= FRAME_SIZE) {
+                            const frame = audioBuffer.slice(0, FRAME_SIZE);
+                            audioBuffer = audioBuffer.slice(FRAME_SIZE);
+                            
+                            const samples = new Int16Array(frame.buffer, frame.byteOffset, frame.length / 2);
+                            audioSource.onData({
+                                samples: samples,
+                                sampleRate: 48000,
+                                bitsPerSample: 16,
+                                channelCount: 1
+                            });
+                        }
+                    } catch (e) {
+                        console.error("Audio error:", e.message);
                     }
-                    
-                    audioSource.onData({
-                        samples: upsampled,
-                        sampleRate: 48000,
-                        bitsPerSample: 16,
-                        channelCount: 1
-                    });
                 }
             } else {
                 try {
@@ -230,7 +237,7 @@ async function connectToUltravox(joinUrl) {
             reject(err);
         });
 
-        ultravoxWs.on("close", (code, reason) => {
+        ultravoxWs.on("close", (code) => {
             console.log(`🔌 Ultravox closed: ${code}`);
         });
 
@@ -275,6 +282,7 @@ function cleanup() {
     if (whatsappPc) { whatsappPc.close(); whatsappPc = null; }
     if (audioSink) { audioSink.stop(); audioSink = null; }
     audioSource = null;
+    audioBuffer = Buffer.alloc(0);
 }
 
 const PORT = process.env.PORT || 3000;
