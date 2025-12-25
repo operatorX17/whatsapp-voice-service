@@ -1,0 +1,16 @@
+{
+  "name": "whatsapp-voice-service",
+  "version": "2.0.0",
+  "description": "Voice calling service with Ultravox AI and WebRTC",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.0",
+    "socket.io": "^4.6.0",
+    "@roamhq/wrtc": "^0.8.0"
+  }
+}
