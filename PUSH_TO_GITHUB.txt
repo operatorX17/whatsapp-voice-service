@@ -1,0 +1,18 @@
+After creating the repo on GitHub, run these commands:
+
+cd voice-service
+git remote add origin https://github.com/operatorX17/whatsapp-voice-service.git
+git branch -M master
+git push -u origin master
+
+Then deploy on Railway:
+1. Go to Railway
+2. Click "+ New" → "GitHub Repo"
+3. Select: operatorX17/whatsapp-voice-service
+4. Railway will auto-detect Dockerfile
+5. Add environment variables:
+   - HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID
+   - HEALTHCARE_WHATSAPP_ACCESS_TOKEN
+   - HEALTHCARE_WHATSAPP_VERIFY_TOKEN
+   - ULTRAVOX_API_KEY
+6. Deploy!
