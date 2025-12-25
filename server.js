@@ -13,7 +13,7 @@ const {
 // STUN server for NAT traversal
 const ICE_SERVERS = [{ urls: "stun:stun.relay.metered.ca:80" }];
 
-const WHATSAPP_API_URL = `https://graph.facebook.com/v21.0/${process.env.HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID}/calls`;
+const WHATSAPP_API_URL = `https://graph.facebook.com/v24.0/${process.env.HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID}/calls`;
 const ACCESS_TOKEN = `Bearer ${process.env.HEALTHCARE_WHATSAPP_ACCESS_TOKEN}`;
 const VERIFY_TOKEN = process.env.HEALTHCARE_WHATSAPP_VERIFY_TOKEN;
 const ULTRAVOX_API_KEY = process.env.ULTRAVOX_API_KEY;
