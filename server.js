@@ -26,9 +26,14 @@ let ultravoxWs = null;
 let audioSource = null;
 let audioSink = null;
 
-// Audio buffer - use array of bytes for simpler handling
-let pendingAudio = [];
+// Audio buffers
+let outputBuffer = []; // Ultravox -> WhatsApp
 const SAMPLES_PER_FRAME = 480; // 10ms at 48kHz
+
+// Use 16kHz for Ultravox (better quality than 8kHz)
+const ULTRAVOX_SAMPLE_RATE = 16000;
+const WHATSAPP_SAMPLE_RATE = 48000;
+const RESAMPLE_RATIO = WHATSAPP_SAMPLE_RATE / ULTRAVOX_SAMPLE_RATE; // 3
 
 console.log("🎙️  WhatsApp Voice + Ultravox AI");
 console.log("Phone ID:", process.env.HEALTHCARE_WHATSAPP_PHONE_NUMBER_ID);
@@ -96,16 +101,16 @@ async function createUltravoxCall(callerName) {
         "https://api.ultravox.ai/api/calls",
         {
             systemPrompt: `You are a friendly healthcare assistant. The caller is ${callerName}. 
-Help with booking diagnostic tests or ordering medicines. Be warm and conversational.
-Start by saying "Hello! Welcome to our healthcare service. How can I help you today?"`,
+Help with booking diagnostic tests or ordering medicines. Be warm, conversational, and respond naturally.
+Start by greeting them and asking how you can help.`,
             model: "fixie-ai/ultravox",
             voice: "Mark",
             temperature: 0.6,
             firstSpeaker: "FIRST_SPEAKER_AGENT",
             medium: {
                 serverWebSocket: {
-                    inputSampleRate: 8000,
-                    outputSampleRate: 8000
+                    inputSampleRate: ULTRAVOX_SAMPLE_RATE,
+                    outputSampleRate: ULTRAVOX_SAMPLE_RATE
                 }
             }
         },
@@ -121,7 +126,7 @@ Start by saying "Hello! Welcome to our healthcare service. How can I help you to
 
 async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
     whatsappPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    pendingAudio = [];
+    outputBuffer = [];
 
     audioSource = new RTCAudioSource();
     const track = audioSource.createTrack();
@@ -135,20 +140,7 @@ async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
         if (audioTrack) {
             audioSink = new RTCAudioSink(audioTrack);
             audioSink.ondata = (data) => {
-                if (ultravoxWs && ultravoxWs.readyState === WebSocket.OPEN) {
-                    // Downsample from 48kHz to 8kHz
-                    const samples = data.samples;
-                    const ratio = 6;
-                    const outLen = Math.floor(samples.length / ratio);
-                    const int16 = new Int16Array(outLen);
-                    
-                    for (let i = 0; i < outLen; i++) {
-                        const s = samples[i * ratio];
-                        int16[i] = Math.max(-32768, Math.min(32767, Math.floor(s * 32767)));
-                    }
-                    
-                    ultravoxWs.send(Buffer.from(int16.buffer));
-                }
+                sendAudioToUltravox(data);
             };
         }
     };
@@ -173,40 +165,71 @@ async function setupBridge(whatsappOfferSdp, ultravoxJoinUrl) {
     }
 }
 
+// Send WhatsApp audio to Ultravox (downsample 48kHz -> 16kHz)
+function sendAudioToUltravox(data) {
+    if (!ultravoxWs || ultravoxWs.readyState !== WebSocket.OPEN) return;
+    
+    try {
+        const samples = data.samples; // Float32Array from WhatsApp
+        const inputRate = data.sampleRate || 48000;
+        const ratio = Math.round(inputRate / ULTRAVOX_SAMPLE_RATE);
+        
+        // Downsample with simple averaging for better quality
+        const outLen = Math.floor(samples.length / ratio);
+        const int16 = new Int16Array(outLen);
+        
+        for (let i = 0; i < outLen; i++) {
+            // Average multiple samples for smoother downsampling
+            let sum = 0;
+            for (let j = 0; j < ratio; j++) {
+                sum += samples[i * ratio + j];
+            }
+            const avg = sum / ratio;
+            int16[i] = Math.max(-32768, Math.min(32767, Math.round(avg * 32767)));
+        }
+        
+        ultravoxWs.send(Buffer.from(int16.buffer));
+    } catch (e) {
+        // Ignore errors
+    }
+}
+
+// Process Ultravox audio and send to WhatsApp (upsample 16kHz -> 48kHz)
 function processUltravoxAudio(data) {
     if (!audioSource || data.length === 0) return;
     
     try {
-        // Ultravox sends 8kHz Int16 PCM
-        // We need to upsample to 48kHz and send in 480-sample frames
-        
         const inputSamples = new Int16Array(data.buffer, data.byteOffset, data.length / 2);
         
-        // Upsample 8kHz -> 48kHz (multiply by 6)
+        // Linear interpolation for smoother upsampling
         for (let i = 0; i < inputSamples.length; i++) {
-            const sample = inputSamples[i];
-            // Add 6 copies of each sample for upsampling
-            for (let j = 0; j < 6; j++) {
-                pendingAudio.push(sample);
+            const currentSample = inputSamples[i];
+            const nextSample = i < inputSamples.length - 1 ? inputSamples[i + 1] : currentSample;
+            
+            // Interpolate between samples
+            for (let j = 0; j < RESAMPLE_RATIO; j++) {
+                const t = j / RESAMPLE_RATIO;
+                const interpolated = Math.round(currentSample * (1 - t) + nextSample * t);
+                outputBuffer.push(interpolated);
             }
         }
         
-        // Send complete 480-sample frames
-        while (pendingAudio.length >= SAMPLES_PER_FRAME) {
+        // Send complete frames
+        while (outputBuffer.length >= SAMPLES_PER_FRAME) {
             const frame = new Int16Array(SAMPLES_PER_FRAME);
             for (let i = 0; i < SAMPLES_PER_FRAME; i++) {
-                frame[i] = pendingAudio.shift();
+                frame[i] = outputBuffer.shift();
             }
             
             audioSource.onData({
                 samples: frame,
-                sampleRate: 48000,
+                sampleRate: WHATSAPP_SAMPLE_RATE,
                 bitsPerSample: 16,
                 channelCount: 1
             });
         }
     } catch (e) {
-        // Silently ignore audio errors
+        // Silently ignore
     }
 }
 
@@ -285,7 +308,7 @@ function cleanup() {
     if (whatsappPc) { whatsappPc.close(); whatsappPc = null; }
     if (audioSink) { audioSink.stop(); audioSink = null; }
     audioSource = null;
-    pendingAudio = [];
+    outputBuffer = [];
 }
 
 const PORT = process.env.PORT || 3000;
